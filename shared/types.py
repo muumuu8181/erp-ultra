@@ -6,8 +6,28 @@ from datetime import datetime, date
 from decimal import Decimal
 from typing import Optional, Generic, TypeVar
 from pydantic import BaseModel as PydanticBase
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import Integer, String, DateTime, func
 from enum import Enum
 
+
+# ── SQLAlchemy Base ──────────────────────────────────────────
+
+class Base(DeclarativeBase):
+    """All ORM models MUST inherit from this class."""
+    pass
+
+
+class BaseModel(Base):
+    """Abstract base with id, created_at, updated_at columns."""
+    __abstract__ = True
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+
+
+# ── Pydantic / Shared Types ─────────────────────────────────
 
 T = TypeVar('T')
 
