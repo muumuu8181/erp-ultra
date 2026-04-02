@@ -1,0 +1,406 @@
+## Overview
+
+Implement the Database Migration module using Alembic for async SQLAlchemy. This module manages schema migrations, tracks applied revisions per module, and provides an HTTP API for controlling migrations programmatically.
+
+## Directory to Create
+
+```
+src/foundation/_009_migration/
+├── __init__.py
+├── models.py
+├── schemas.py
+├── service.py
+├── router.py
+├── validators.py
+├── README.md
+└── tests/
+    ├── __init__.py
+    ├── test_models.py
+    ├── test_service.py
+    ├── test_router.py
+    └── test_validators.py
+```
+
+## Key Rules
+
+- All directories use underscore prefix: `_009_migration`
+- Import SQLAlchemy Base from `shared.types`: `from shared.types import Base, BaseModel`
+- Import Pydantic schemas from `shared.types`: `from shared.types import BaseSchema, PaginatedResponse, AuditableMixin, SoftDeleteMixin`
+- Import errors from `shared.errors`: `from shared.errors import NotFoundError, ValidationError, DuplicateError, BusinessRuleError`
+- Import schema constants from `shared.schema`: `from shared.schema import ColLen, Precision`
+- DB sessions come from `src.foundation._001_database.engine`: `from src.foundation._001_database.engine import get_db`
+- All public functions must have type hints and docstrings
+- Router prefix pattern: `/api/v1/migrations`
+- Tests use pytest-asyncio
+- This module is INDEPENDENT - only import from `shared/` and `src.foundation._001_database`
+
+## Models (`models.py`)
+
+### `MigrationRecord`
+
+SQLAlchemy model inheriting from `BaseModel` (from `shared.types`).
+
+```python
+class MigrationRecord(BaseModel):
+    """Tracks applied database migrations."""
+    __tablename__ = "migration_record"
+
+    version: Mapped[str] = mapped_column(String(ColLen.CODE), nullable=False, unique=True, comment="Alembic revision hash")
+    module: Mapped[str] = mapped_column(String(ColLen.NAME), nullable=False, comment="Module that owns this migration (e.g. _009_migration)")
+    description: Mapped[str] = mapped_column(String(ColLen.DESCRIPTION), nullable=False, default="", comment="Human-readable description of the migration")
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False, comment="Timestamp when migration was applied")
+    applied_by: Mapped[str] = mapped_column(String(ColLen.SHORT_NAME), nullable=False, default="system", comment="User or process that applied the migration")
+```
+
+- Use `from sqlalchemy.orm import Mapped, mapped_column` and `from sqlalchemy import String, DateTime, func`
+- Inherit `id`, `created_at`, `updated_at` from `BaseModel`
+
+## Schemas (`schemas.py`)
+
+```python
+from shared.types import BaseSchema, PaginatedResponse
+from shared.schema import ColLen
+from datetime import datetime
+from typing import Optional
+from pydantic import Field
+
+class MigrationModuleStatus(BaseSchema):
+    """Status of migrations for a single module."""
+    module: str = Field(..., description="Module directory name (e.g. _009_migration)")
+    current_version: Optional[str] = Field(None, description="Current applied revision hash")
+    current_description: Optional[str] = Field(None, description="Description of current revision")
+    applied_count: int = Field(0, description="Number of migrations applied for this module")
+    last_applied_at: Optional[datetime] = Field(None, description="Timestamp of most recent applied migration")
+
+class MigrationStatusResponse(BaseSchema):
+    """Overall migration status across all modules."""
+    current_revision: Optional[str] = Field(None, description="Current Alembic head revision")
+    is_up_to_date: bool = Field(False, description="True if no pending migrations")
+    pending_count: int = Field(0, description="Number of pending migrations")
+    modules: list[MigrationModuleStatus] = Field(default_factory=list, description="Per-module status breakdown")
+
+class MigrationApplyRequest(BaseSchema):
+    """Request to apply a migration."""
+    revision: Optional[str] = Field(None, description="Specific revision to apply. If None, applies all pending.")
+    module: Optional[str] = Field(None, description="Restrict to a specific module.")
+    applied_by: str = Field("system", max_length=ColLen.SHORT_NAME)
+
+class MigrationRollbackRequest(BaseSchema):
+    """Request to rollback a migration."""
+    revision: str = Field(..., description="Revision to rollback to")
+    module: Optional[str] = Field(None, description="Restrict to a specific module.")
+    rolled_back_by: str = Field("system", max_length=ColLen.SHORT_NAME)
+
+class MigrationHistoryEntry(BaseSchema):
+    """A single entry in migration history."""
+    id: int
+    version: str
+    module: str
+    description: str
+    applied_at: datetime
+    applied_by: str
+```
+
+## Service (`service.py`)
+
+All service functions receive an `AsyncSession` as the first argument (dependency injection). Each function must have a full docstring with Args/Returns.
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession
+
+async def get_current_revision(db: AsyncSession) -> Optional[str]:
+    """Return the current head revision from the migration_record table.
+
+    Args:
+        db: AsyncSession for database access.
+    Returns:
+        The version string of the most recently applied migration, or None if none applied.
+    """
+
+async def get_pending_migrations(db: AsyncSession) -> list[dict[str, str]]:
+    """List migrations that have not yet been applied.
+
+    Reads the Alembic migration directory and compares against applied MigrationRecords.
+
+    Args:
+        db: AsyncSession for database access.
+    Returns:
+        List of dicts with keys: revision, module, description.
+    """
+
+async def apply_migration(db: AsyncSession, revision: Optional[str], module: Optional[str], applied_by: str) -> MigrationRecord:
+    """Apply a migration (or all pending if revision is None).
+
+    Args:
+        db: AsyncSession for database access.
+        revision: Specific revision hash to apply. If None, applies all pending.
+        module: If provided, only apply migrations belonging to this module.
+        applied_by: Identifier of who is applying the migration.
+    Returns:
+        The MigrationRecord for the applied migration.
+    Raises:
+        NotFoundError: If specified revision does not exist.
+        DuplicateError: If the migration has already been applied.
+        BusinessRuleError: If applying migrations out of order.
+    """
+
+async def rollback_migration(db: AsyncSession, revision: str, module: Optional[str]) -> MigrationRecord:
+    """Rollback to a specific revision.
+
+    Removes the MigrationRecord for the given revision. The actual schema rollback
+    is handled by Alembic downgrade.
+
+    Args:
+        db: AsyncSession for database access.
+        revision: Target revision to rollback to.
+        module: If provided, restrict rollback to this module.
+    Returns:
+        The MigrationRecord that was removed.
+    Raises:
+        NotFoundError: If the specified revision is not found in applied migrations.
+        BusinessRuleError: If rollback would break dependencies.
+    """
+
+async def get_migration_history(db: AsyncSession, limit: int = 50, offset: int = 0) -> list[MigrationRecord]:
+    """Return migration history ordered by applied_at descending.
+
+    Args:
+        db: AsyncSession for database access.
+        limit: Maximum number of records to return.
+        offset: Number of records to skip.
+    Returns:
+        List of MigrationRecord objects.
+    """
+
+async def get_module_status(db: AsyncSession) -> list[MigrationModuleStatus]:
+    """Get migration status grouped by module.
+
+    Args:
+        db: AsyncSession for database access.
+    Returns:
+        List of MigrationModuleStatus, one per module that has migrations.
+    """
+```
+
+Additionally, create a helper function:
+
+```python
+async def generate_migration_stamp(module: str, description: str) -> str:
+    """Generate a stamped migration file for a given module.
+
+    Creates an Alembic migration file with proper module tagging in the
+    revision description. The migration file is placed in the Alembic
+    migrations directory.
+
+    Args:
+        module: The module directory name (e.g. "_009_migration").
+        description: Human-readable description of the migration.
+    Returns:
+        The generated revision hash string.
+    """
+```
+
+## Alembic Configuration
+
+Create an `alembic.ini` and `alembic/` directory at the project root level (not inside the module). The module itself interacts with Alembic programmatically.
+
+Key requirements for `alembic/env.py`:
+- Configure for async SQLAlchemy using `asyncio` mode
+- Import `Base` from `shared.types` for `target_metadata`
+- Set `render_as_batch = True` for SQLite compatibility
+- Set `sqlalchemy.url` from the `DATABASE_URL` environment variable (same as `_001_database.engine.DATABASE_URL`)
+
+Example `env.py` structure:
+```python
+import asyncio
+from logging.config import fileConfig
+from sqlalchemy import pool
+from sqlalchemy.ext.asyncio import async_engine_from_config
+from alembic import context
+
+from shared.types import Base
+
+config = context.config
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+def run_migrations_offline() -> None:
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(url=url, target_metadata=target_metadata, literal_binds=True, render_as_batch=True)
+    with context.begin_transaction():
+        context.run_migrations()
+
+def do_run_migrations(connection):
+    context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)
+    with context.begin_transaction():
+        context.run_migrations()
+
+async def run_async_migrations() -> None:
+    connectable = async_engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
+    await connectable.dispose()
+
+def run_migrations_online() -> None:
+    asyncio.run(run_async_migrations())
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+```
+
+## Router (`router.py`)
+
+```python
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from src.foundation._001_database.engine import get_db
+
+router = APIRouter(prefix="/api/v1/migrations", tags=["migrations"])
+```
+
+### Endpoints
+
+| Method | Path | Description | Request Body | Response |
+|--------|------|-------------|--------------|----------|
+| GET | `/migrations/status` | Get overall migration status | None | `MigrationStatusResponse` |
+| GET | `/migrations/pending` | List pending migrations | None | `list[dict]` |
+| POST | `/migrations/apply` | Apply one or more migrations | `MigrationApplyRequest` | `MigrationHistoryEntry` |
+| POST | `/migrations/rollback` | Rollback to a specific revision | `MigrationRollbackRequest` | `MigrationHistoryEntry` |
+| GET | `/migrations/history` | Get migration history | None (query: limit, offset) | `list[MigrationHistoryEntry]` |
+
+Each endpoint function must:
+- Use `db: AsyncSession = Depends(get_db)` for DB access
+- Have a docstring
+- Call the corresponding service function
+- Return the appropriate schema
+
+## Validators (`validators.py`)
+
+```python
+import re
+
+def validate_revision_format(revision: str) -> str:
+    """Validate that a revision string is a valid format (alphanumeric, 12 chars hex).
+
+    Args:
+        revision: The revision hash to validate.
+    Returns:
+        The validated revision string.
+    Raises:
+        ValidationError: If the revision format is invalid.
+    """
+
+async def validate_migration_not_applied(db: AsyncSession, revision: str) -> None:
+    """Ensure the given migration revision has not already been applied.
+
+    Args:
+        db: AsyncSession for database access.
+        revision: The revision hash to check.
+    Raises:
+        DuplicateError: If the migration has already been applied.
+    """
+
+def validate_module_name(module: str) -> str:
+    """Validate that a module name follows the pattern _NNN_name.
+
+    Args:
+        module: Module directory name.
+    Returns:
+        The validated module name.
+    Raises:
+        ValidationError: If the format is invalid.
+    """
+```
+
+## Test Requirements (`tests/`)
+
+All tests use pytest-asyncio. Use in-memory SQLite (`sqlite+aiosqlite://`) for database tests.
+
+### `test_models.py`
+- Test `MigrationRecord` creation with all fields
+- Test default values (applied_at auto-set, applied_by defaults to "system")
+- Test unique constraint on `version` field
+- Test `__repr__` if implemented
+
+### `test_service.py`
+- Test `get_current_revision` with no migrations (returns None)
+- Test `get_current_revision` after applying a migration
+- Test `get_pending_migrations` returns correct list
+- Test `apply_migration` creates a MigrationRecord
+- Test `apply_migration` raises DuplicateError for already-applied migration
+- Test `apply_migration` raises NotFoundError for non-existent revision
+- Test `rollback_migration` removes the MigrationRecord
+- Test `rollback_migration` raises NotFoundError for non-applied revision
+- Test `get_migration_history` returns ordered records
+- Test `get_module_status` groups correctly by module
+
+### `test_router.py`
+- Use `httpx.AsyncClient` with `ASGITransport` (same pattern as `_001_database/tests/test_router.py`)
+- Create a `FastAPI` app fixture that includes the migration router
+- Override `get_db` dependency with a test session
+- Test GET `/api/v1/migrations/status` returns 200
+- Test GET `/api/v1/migrations/pending` returns 200
+- Test POST `/api/v1/migrations/apply` returns 200 on success
+- Test POST `/api/v1/migrations/apply` returns 400/409 for invalid/duplicate
+- Test POST `/api/v1/migrations/rollback` returns 200 on success
+- Test GET `/api/v1/migrations/history` returns 200 with list
+
+### `test_validators.py`
+- Test `validate_revision_format` with valid hex strings
+- Test `validate_revision_format` raises ValidationError for invalid formats
+- Test `validate_module_name` with valid patterns like `_009_migration`
+- Test `validate_module_name` raises ValidationError for invalid patterns
+- Test `validate_migration_not_applied` passes for new revision
+- Test `validate_migration_not_applied` raises DuplicateError for applied revision
+
+### Test fixture pattern (follow exactly):
+```python
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from shared.types import Base
+
+TEST_DB_URL = "sqlite+aiosqlite://"
+
+@pytest.fixture
+async def db_session():
+    engine = create_async_engine(TEST_DB_URL)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()
+```
+
+## Dependencies
+
+Only import from these locations:
+- `shared.types` -> `Base, BaseModel, BaseSchema, PaginatedResponse`
+- `shared.errors` -> `NotFoundError, ValidationError, DuplicateError, BusinessRuleError`
+- `shared.schema` -> `ColLen, Precision`
+- `src.foundation._001_database.engine` -> `get_db`
+- Standard library: `os, re, datetime, typing`
+- Third-party: `sqlalchemy`, `pydantic`, `fastapi`, `alembic`, `pytest`, `httpx`
+
+## Quality Checklist
+
+- [ ] All files have module-level docstrings
+- [ ] All public functions have type hints and docstrings
+- [ ] Models inherit from `BaseModel` with correct `__tablename__`
+- [ ] Schemas inherit from `BaseSchema` with `Config: from_attributes = True`
+- [ ] Router uses prefix `/api/v1/migrations`
+- [ ] All error cases use exceptions from `shared.errors`
+- [ ] Tests pass with `pytest -x src/foundation/_009_migration/tests/`
+- [ ] No imports from other foundation modules (only `shared/` and `_001_database`)
+- [ ] Alembic `env.py` configured for async with `render_as_batch=True`
+- [ ] `__init__.py` exports all public symbols
