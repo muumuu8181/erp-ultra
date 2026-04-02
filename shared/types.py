@@ -34,8 +34,7 @@ T = TypeVar('T')
 
 class BaseSchema(PydanticBase):
     """Base for all Pydantic schemas in the system."""
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class AuditableMixin(BaseSchema):
