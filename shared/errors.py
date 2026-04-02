@@ -4,9 +4,11 @@ All modules raise these exceptions for consistent error handling.
 """
 
 
+from typing import Any
+
 class ERPError(Exception):
     """Base exception for all ERP errors."""
-    def __init__(self, message: str, code: str = "ERP_ERROR", details: dict | None = None):
+    def __init__(self, message: str, code: str = "ERP_ERROR", details: dict[str, Any] | None = None):
         self.message = message
         self.code = code
         self.details = details or {}
@@ -15,7 +17,7 @@ class ERPError(Exception):
 
 class ValidationError(ERPError):
     """Input validation failed."""
-    def __init__(self, message: str, field: str = "", details: dict | None = None):
+    def __init__(self, message: str, field: str = "", details: dict[str, Any] | None = None):
         super().__init__(message, "VALIDATION_ERROR", details)
         self.field = field
 
