@@ -1,0 +1,452 @@
+[Phase 0] 008 - Caching Layer
+## Overview
+
+Implement the Caching Layer module (`_008_cache`) for the ERP system. This module provides an in-memory LRU cache with TTL support, cache hit/miss tracking per module, pattern-based invalidation, and a background cleanup task for expired entries.
+
+**You MUST follow the exact conventions below. Read every section carefully before writing any code.**
+
+---
+
+## Directory to Create
+
+```
+src/foundation/_008_cache/
+├── __init__.py
+├── models.py
+├── schemas.py
+├── service.py
+├── router.py
+├── validators.py
+├── README.md
+└── tests/
+    ├── __init__.py
+    ├── test_models.py
+    ├── test_service.py
+    ├── test_router.py
+    └── test_validators.py
+```
+
+---
+
+## Import Rules (CRITICAL)
+
+This module is **INDEPENDENT**. Only import from these locations:
+
+```python
+# SQLAlchemy base classes
+from shared.types import Base, BaseModel
+
+# Pydantic schemas
+from shared.types import BaseSchema, PaginatedResponse, AuditableMixin, SoftDeleteMixin
+
+# Custom errors
+from shared.errors import NotFoundError, ValidationError, DuplicateError, BusinessRuleError
+
+# Schema constants
+from shared.schema import ColLen, Precision
+
+# Database session
+from src.foundation._001_database.engine import get_db
+```
+
+Do NOT import from any other `_NNN_*` module.
+
+---
+
+## Models (`models.py`)
+
+Use SQLAlchemy 2.0 `Mapped` + `mapped_column` style. All models inherit from `Base` (from `shared.types`).
+
+### Table: `cache_entries`
+
+```python
+class CacheEntry(Base):
+    __tablename__ = "cache_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(ColLen.CODE), unique=True, nullable=False, index=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)  # JSON string
+    ttl_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    module: Mapped[str] = mapped_column(String(ColLen.SHORT_NAME), nullable=False, index=True)
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+```
+
+### Table: `cache_stats`
+
+```python
+class CacheStatsRecord(Base):
+    __tablename__ = "cache_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    module: Mapped[str] = mapped_column(String(ColLen.SHORT_NAME), nullable=False, index=True)
+    hits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    misses: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    evictions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+```
+
+---
+
+## Schemas (`schemas.py`)
+
+All schemas inherit from `BaseSchema` (from `shared.types`).
+
+```python
+class CacheEntryCreate(BaseSchema):
+    """Schema for creating/updating a cache entry."""
+    key: str
+    value: str  # Must be valid JSON
+    ttl_seconds: int
+    module: str
+
+class CacheEntryUpdate(BaseSchema):
+    """Schema for updating a cache entry."""
+    value: str | None = None  # Must be valid JSON if provided
+    ttl_seconds: int | None = None
+
+class CacheEntryResponse(BaseSchema):
+    """Schema for cache entry response."""
+    id: int
+    key: str
+    value: str
+    ttl_seconds: int
+    expires_at: datetime
+    module: str
+    hit_count: int
+    created_at: datetime
+    updated_at: datetime
+
+class CacheStatsResponse(BaseSchema):
+    """Schema for cache statistics response."""
+    module: str
+    total_hits: int
+    total_misses: int
+    total_evictions: int
+    hit_rate: float  # hits / (hits + misses) as percentage
+    entry_count: int
+    recent_stats: list[CacheStatsRecordResponse]
+
+class CacheStatsRecordResponse(BaseSchema):
+    """Schema for a single stats record."""
+    id: int
+    module: str
+    hits: int
+    misses: int
+    evictions: int
+    recorded_at: datetime
+
+class CacheBulkDelete(BaseSchema):
+    """Schema for bulk cache deletion."""
+    keys: list[str]
+
+class CacheInvalidateRequest(BaseSchema):
+    """Schema for pattern-based invalidation."""
+    pattern: str  # Prefix pattern, e.g. "inventory:*" or "orders:customer:123"
+
+class CacheWarmRequest(BaseSchema):
+    """Schema for cache warming."""
+    entries: list[CacheEntryCreate]
+```
+
+---
+
+## Validators (`validators.py`)
+
+Each validator function raises `ValidationError` (from `shared.errors`) on failure.
+
+### Functions to implement:
+
+```python
+def validate_cache_key(key: str) -> None:
+    """
+    Validate cache key format: module:entity:id
+    Rules:
+    - Must match pattern: colon-separated segments
+    - Pattern: r'^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)+$'
+    - Minimum 2 segments (e.g., "inventory:products" is valid)
+    - Maximum 5 segments
+    - Total length <= 50
+    Raises ValidationError with field="key" if invalid.
+    """
+
+def validate_cache_value(value: str) -> None:
+    """
+    Validate cache value is valid JSON.
+    - Parse with json.loads()
+    - Raise ValidationError with field="value" if not valid JSON
+    """
+
+def validate_ttl(ttl_seconds: int) -> None:
+    """
+    Validate TTL is reasonable.
+    Rules: must be >= 1 and <= 86400 (1 day).
+    Raises ValidationError with field="ttl_seconds" if invalid.
+    """
+
+def validate_module_name(module: str) -> None:
+    """
+    Validate module name.
+    Known modules: ["system", "auth", "rbac", "gateway", "config",
+                    "logging", "queue", "cache", "inventory", "orders",
+                    "customers", "accounting", "reports", "hr"]
+    Raises ValidationError with field="module" if not in known list.
+    """
+```
+
+---
+
+## Service (`service.py`)
+
+All service functions are `async` and accept `db: AsyncSession` as the first parameter. All public functions must have type hints and docstrings.
+
+### In-Memory LRU Cache:
+
+```python
+from collections import OrderedDict
+from datetime import datetime, timedelta
+import asyncio
+
+# In-memory LRU cache: OrderedDict[key] -> {value, expires_at, module, hit_count}
+_cache_store: OrderedDict[str, dict] = OrderedDict()
+
+# Module-level stats tracking (in-memory, periodically flushed to DB)
+_stats_counters: dict[str, dict[str, int]] = {}  # {module: {"hits": N, "misses": N, "evictions": N}}
+```
+
+### Functions to implement:
+
+```python
+async def get(db: AsyncSession, key: str) -> CacheEntry:
+    """
+    Get a value from cache.
+    - Check in-memory cache first
+    - If found and not expired:
+      1. Move to end of OrderedDict (LRU update)
+      2. Increment hit_count
+      3. Increment module stats hits
+      4. Return CacheEntry
+    - If expired: remove from cache, increment misses, record eviction
+    - If not found in memory: check DB (fallback)
+      - If in DB and not expired: load into memory, return
+      - If in DB but expired: delete from DB, record miss
+    - If not found anywhere: increment misses, raise NotFoundError
+    """
+
+async def set(db: AsyncSession, data: CacheEntryCreate) -> CacheEntry:
+    """
+    Set a cache value.
+    - Validate key, value, ttl, module
+    - Calculate expires_at = now + ttl_seconds
+    - Store in in-memory OrderedDict (move to end = most recently used)
+    - Upsert in DB (create or update)
+    - Return CacheEntry
+    """
+
+async def delete(db: AsyncSession, key: str) -> None:
+    """
+    Delete a cache entry.
+    - Remove from in-memory cache
+    - Delete from DB
+    - Raise NotFoundError if key does not exist
+    """
+
+async def clear_by_module(db: AsyncSession, module: str) -> int:
+    """
+    Clear all cache entries for a module.
+    - Remove matching keys from in-memory cache
+    - Delete matching entries from DB
+    - Return count of cleared entries
+    """
+
+async def get_stats(db: AsyncSession, module: str | None = None) -> list[CacheStatsResponse]:
+    """
+    Get cache statistics.
+    - If module specified: return stats for that module
+    - If no module: return stats for all modules
+    - Calculate from in-memory counters + DB records
+    - For each module:
+      1. total_hits, total_misses, total_evictions
+      2. hit_rate = hits / (hits + misses) * 100 (0 if no hits/misses)
+      3. entry_count = number of active cache entries
+      4. recent_stats = last 10 DB stats records
+    - Return list of CacheStatsResponse
+    """
+
+async def invalidate_pattern(db: AsyncSession, pattern: str) -> int:
+    """
+    Invalidate cache entries matching a pattern.
+    - Pattern is a prefix: "inventory:*" matches all keys starting with "inventory:"
+    - For prefix matching, strip trailing "*" if present
+    - Find all keys in in-memory cache matching the prefix
+    - Remove matching entries from memory and DB
+    - Return count of invalidated entries
+    """
+
+async def warm_cache(db: AsyncSession, entries: list[CacheEntryCreate]) -> list[CacheEntry]:
+    """
+    Pre-populate cache with multiple entries.
+    - Validate all entries
+    - For each entry, call set()
+    - Return list of CacheEntry
+    """
+
+async def cleanup_expired(db: AsyncSession) -> int:
+    """
+    Background task: remove expired entries from memory and DB.
+    - Iterate in-memory cache, remove entries where expires_at < now
+    - Delete from DB where expires_at < now
+    - Record evictions in stats
+    - Return count of cleaned entries
+    """
+
+async def flush_stats(db: AsyncSession) -> None:
+    """
+    Flush in-memory stats counters to DB.
+    - For each module in _stats_counters:
+      1. Create CacheStatsRecord with current counters
+      2. Reset in-memory counters
+    """
+
+def clear_cache_state() -> None:
+    """
+    Clear all in-memory cache and stats state.
+    Useful for testing.
+    """
+
+def get_cache_size() -> int:
+    """
+    Return number of entries in in-memory cache.
+    """
+
+def get_memory_usage_estimate() -> int:
+    """
+    Estimate memory usage of in-memory cache in bytes.
+    Sum of len(key) + len(value) for all entries.
+    """
+```
+
+### Background Task Setup:
+
+Provide a function that can be used with FastAPI lifespan to run periodic cleanup:
+
+```python
+async def start_cleanup_task(db_session_factory, interval_seconds: int = 60) -> None:
+    """
+    Periodic task that runs cleanup_expired and flush_stats.
+    Called from FastAPI lifespan startup.
+    Runs in an infinite loop with asyncio.sleep(interval_seconds).
+    Should handle exceptions gracefully and continue.
+    """
+```
+
+---
+
+## Router (`router.py`)
+
+Router prefix: `/api/v1/cache`
+
+```python
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from src.foundation._001_database.engine import get_db
+
+router = APIRouter(prefix="/api/v1/cache", tags=["cache"])
+```
+
+### Endpoints:
+
+| Method | Path | Description | Request Body / Params | Response |
+|--------|------|-------------|----------------------|----------|
+| GET | `/{key}` | Get cache entry | - | `CacheEntryResponse` |
+| PUT | `/{key}` | Set cache entry | `CacheEntryCreate` | `CacheEntryResponse` |
+| DELETE | `/{key}` | Delete cache entry | - | `{"message": "Cache entry deleted"}` |
+| DELETE | `/` | Clear cache by module | Query: module | `{"cleared_count": N}` |
+| POST | `/invalidate` | Invalidate by pattern | `CacheInvalidateRequest` | `{"invalidated_count": N}` |
+| GET | `/stats` | Get cache statistics | Query: module (optional) | `list[CacheStatsResponse]` |
+| POST | `/warm` | Warm cache with entries | `CacheWarmRequest` | `list[CacheEntryResponse]` |
+| POST | `/cleanup` | Trigger manual cleanup | - | `{"cleaned_count": N}` |
+
+Note: PUT `/{key}` accepts a `CacheEntryCreate` body where the `key` field in the URL takes precedence.
+
+---
+
+## Tests
+
+### `tests/test_models.py`
+- Test `CacheEntry` model creation with valid data
+- Test `CacheStatsRecord` model creation with valid data
+- Test unique constraint on cache key
+- Test default values (hit_count=0)
+
+### `tests/test_validators.py`
+- `test_validate_cache_key_valid`: "inventory:products:123", "orders:customer:456", "cache:stats"
+- `test_validate_cache_key_single_segment`: "inventory" raises ValidationError
+- `test_validate_cache_key_uppercase`: "Inventory:Products" raises ValidationError
+- `test_validate_cache_key_too_long`: > 50 chars raises ValidationError
+- `test_validate_cache_key_too_many_segments`: 6 segments raises ValidationError
+- `test_validate_cache_value_valid`: valid JSON strings
+- `test_validate_cache_value_invalid`: invalid JSON raises ValidationError
+- `test_validate_ttl_valid`: 1, 60, 3600, 86400
+- `test_validate_ttl_zero`: raises ValidationError
+- `test_validate_ttl_too_large`: 86401 raises ValidationError
+- `test_validate_module_name_valid`: known module names
+- `test_validate_module_name_invalid`: "unknown" raises ValidationError
+
+### `tests/test_service.py`
+- Use in-memory SQLite async session.
+- Clear cache state before each test.
+- `test_set_success`: entry stored in memory and DB
+- `test_set_updates_existing`: upsert behavior
+- `test_get_success`: returns from memory
+- `test_get_hit_count_increments`
+- `test_get_not_found`: raises NotFoundError
+- `test_get_expired`: removes from cache, raises NotFoundError
+- `test_get_db_fallback`: loads from DB if not in memory
+- `test_delete_success`
+- `test_delete_not_found`
+- `test_clear_by_module`: clears only matching entries
+- `test_invalidate_pattern`: matches by prefix
+- `test_invalidate_pattern_with_wildcard`: strips trailing *
+- `test_warm_cache`: pre-populates multiple entries
+- `test_cleanup_expired`: removes expired entries
+- `test_stats_hits_and_misses`: tracks correctly
+- `test_flush_stats`: writes counters to DB
+- `test_lru_eviction_order`: least recently used moved to end
+- `test_clear_cache_state`: empties everything
+
+### `tests/test_router.py`
+- Use `httpx.AsyncClient` with FastAPI TestClient.
+- `test_get_cache_endpoint`: GET /api/v1/cache/{key} -> 200
+- `test_get_cache_not_found`: GET /api/v1/cache/nonexistent -> 404
+- `test_set_cache_endpoint`: PUT /api/v1/cache/{key} -> 200
+- `test_delete_cache_endpoint`: DELETE /api/v1/cache/{key} -> 200
+- `test_clear_by_module_endpoint`: DELETE /api/v1/cache/?module=inventory -> 200
+- `test_invalidate_endpoint`: POST /api/v1/cache/invalidate -> 200
+- `test_stats_endpoint`: GET /api/v1/cache/stats -> 200
+- `test_warm_endpoint`: POST /api/v1/cache/warm -> 200
+- `test_cleanup_endpoint`: POST /api/v1/cache/cleanup -> 200
+
+---
+
+## Quality Checklist
+
+- [ ] All files follow the exact directory structure above
+- [ ] All imports use only `shared/` and `src.foundation._001_database` -- no other `_NNN_*` imports
+- [ ] All models inherit from `Base` (from `shared.types`), NOT from `BaseModel`
+- [ ] All schemas inherit from `BaseSchema` (from `shared.types`)
+- [ ] All errors raised are from `shared.errors` (NotFoundError, ValidationError, DuplicateError, BusinessRuleError)
+- [ ] Column lengths use `ColLen` constants from `shared.schema`
+- [ ] Every public function has type hints and a docstring
+- [ ] Router prefix is `/api/v1/cache`
+- [ ] All tests pass with `pytest -xvs src/foundation/_008_cache/tests/`
+- [ ] No hardcoded SQL -- use SQLAlchemy ORM only
+- [ ] No synchronous DB calls -- all service functions are `async`
+- [ ] `__init__.py` exports router and key service functions
+- [ ] In-memory cache uses OrderedDict for LRU behavior
+- [ ] TTL support with expires_at calculation
+- [ ] Pattern-based invalidation with prefix matching
+- [ ] Hit/miss tracking per module
+- [ ] Background cleanup task for expired entries
