@@ -64,7 +64,7 @@ class Repository(ABC):
         ...
 
     @abstractmethod
-    async def count(self, **filters) -> int:
+    async def count(self, **filters: Any) -> int:
         ...
 
 
@@ -78,7 +78,7 @@ class CrudService(ABC):
         ...
 
     @abstractmethod
-    async def list(self, **filters) -> list[Any]:
+    async def list(self, **filters: Any) -> list[Any]:
         ...
 
     @abstractmethod
