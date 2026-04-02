@@ -1,0 +1,186 @@
+## Overview
+
+Implement the Warehouse Operations module for managing day-to-day warehouse activities including put-away, picking, packing, shipping, and replenishment. Supports multi-task operations with bin-level tracking, pick list optimization by bin location order, and productivity metrics.
+
+## Directory
+
+```
+src/inventory/_057_warehouse_mgmt/
+├── __init__.py
+├── models.py
+├── schemas.py
+├── service.py
+├── router.py
+├── validators.py
+├── README.md
+└── tests/
+    ├── test_models.py
+    ├── test_service.py
+    ├── test_router.py
+    └── test_validators.py
+```
+
+## Models
+
+### `WarehouseOperation` table
+
+| Field | Type | Constraints |
+|-------|------|-------------|
+| id | Integer | PK, auto-increment |
+| operation_number | String(50) | UNIQUE, NOT NULL |
+| warehouse_code | String(50) | NOT NULL |
+| operation_type | Enum[put_away, pick, pack, ship, replenish] | NOT NULL |
+| reference_type | String(50) | NOT NULL |
+| reference_number | String(50) | NOT NULL |
+| status | Enum[pending, in_progress, completed, cancelled] | NOT NULL |
+| assigned_to | String(100) | NOT NULL |
+| priority | Enum[low, medium, high, urgent] | NOT NULL |
+| started_at | DateTime | nullable |
+| completed_at | DateTime | nullable |
+| notes | Text | nullable |
+| created_by | String(100) | NOT NULL |
+| created_at | DateTime | server default |
+| updated_at | DateTime | on update |
+
+### `OperationTask` table
+
+| Field | Type | Constraints |
+|-------|------|-------------|
+| id | Integer | PK, auto-increment |
+| operation_id | Integer | FK -> WarehouseOperation.id |
+| task_number | Integer | NOT NULL |
+| product_code | String(50) | NOT NULL |
+| product_name | String(200) | NOT NULL |
+| quantity | Numeric(15,3) | NOT NULL |
+| from_bin | String(50) | nullable |
+| to_bin | String(50) | nullable |
+| status | Enum[pending, in_progress, completed] | NOT NULL |
+| completed_at | DateTime | nullable |
+| created_at | DateTime | server default |
+| updated_at | DateTime | on update |
+
+## Schemas
+
+- `OperationCreate` - operation_number, warehouse_code, operation_type, reference_type, reference_number, assigned_to, priority?, notes?, created_by, tasks: list[TaskCreate]
+- `OperationUpdate` - assigned_to?, priority?, notes?
+- `OperationResponse` - all WarehouseOperation fields + id, created_at, updated_at, tasks: list[TaskResponse]
+- `TaskCreate` - task_number, product_code, product_name, quantity, from_bin?, to_bin?
+- `TaskResponse` - all OperationTask fields + id, created_at, updated_at
+- `PickListResponse` - operation_id, operation_number, warehouse_code, tasks: list[TaskResponse sorted by from_bin], total_items, total_quantity
+- Productivity response: dict with {operations_per_hour, completion_rate, total_operations, completed_operations, avg_completion_time_minutes}
+
+## Service
+
+```python
+async def create_operation(db: AsyncSession, data: OperationCreate) -> WarehouseOperation
+async def start_operation(db: AsyncSession, operation_id: int) -> WarehouseOperation
+    # Transition: pending -> in_progress, set started_at
+async def complete_task(db: AsyncSession, operation_id: int, task_id: int) -> OperationTask
+    # Mark task as completed, set completed_at
+    # If all tasks completed, auto-complete the operation
+async def complete_operation(db: AsyncSession, operation_id: int) -> WarehouseOperation
+    # Transition: in_progress -> completed, set completed_at
+    # Validate all tasks are completed
+async def cancel_operation(db: AsyncSession, operation_id: int, reason: str | None) -> WarehouseOperation
+    # Transition: pending -> cancelled
+async def generate_pick_list(db: AsyncSession, warehouse_code: str, reference_type: str, reference_number: str, assigned_to: str) -> PickListResponse
+    # Create a pick operation with tasks sorted by bin location order
+    # Optimize pick path: sort tasks by from_bin in ascending order
+async def get_operation(db: AsyncSession, operation_id: int) -> WarehouseOperation
+async def list_operations(db: AsyncSession, warehouse_code: str | None, operation_type: str | None, status: str | None) -> PaginatedResponse
+async def get_productivity(db: AsyncSession, warehouse_code: str, date_from: date, date_to: date) -> dict
+    # Calculate: operations_per_hour, completion_rate, total_operations, completed_operations, avg_completion_time_minutes
+```
+
+## Router
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/warehouse-operations` | Create operation |
+| GET | `/api/v1/warehouse-operations` | List operations (with filters) |
+| GET | `/api/v1/warehouse-operations/{id}` | Get operation detail |
+| PUT | `/api/v1/warehouse-operations/{id}` | Update operation (pending only) |
+| POST | `/api/v1/warehouse-operations/{id}/start` | Start operation |
+| POST | `/api/v1/warehouse-operations/{id}/tasks/{task_id}/complete` | Complete a task |
+| POST | `/api/v1/warehouse-operations/{id}/complete` | Complete operation |
+| POST | `/api/v1/warehouse-operations/{id}/cancel` | Cancel operation |
+| POST | `/api/v1/warehouse-operations/pick-list` | Generate optimized pick list |
+| GET | `/api/v1/warehouse-operations/productivity` | Get productivity metrics |
+
+## Validators
+
+- `operation_type` must be one of: put_away, pick, pack, ship, replenish
+- For move operations (put_away, replenish): `from_bin` must not equal `to_bin`
+- `quantity` must be > 0 on all tasks
+- `operation_number` must be unique
+- Status transitions: pending -> in_progress -> completed, pending -> cancelled
+- Can only update operations in "pending" status
+- Can only cancel operations in "pending" status
+- All tasks must be completed before completing the operation
+
+## Tests
+
+### test_models.py
+- Test WarehouseOperation creation with all fields
+- Test OperationTask creation and FK relationship
+- Test unique constraint on operation_number
+- Test operation_type enum values
+- Test status enum values
+- Test priority enum values
+
+### test_service.py
+- Test create_operation with valid data and tasks
+- Test start_operation (pending -> in_progress, sets started_at)
+- Test complete_task (marks task completed, sets completed_at)
+- Test complete_task auto-completes operation when all tasks done
+- Test complete_operation (in_progress -> completed, sets completed_at)
+- Test complete_operation with incomplete tasks (raises BusinessRuleError)
+- Test cancel_operation (pending -> cancelled)
+- Test cancel_operation in_progress (raises BusinessRuleError)
+- Test generate_pick_list (creates operation, tasks sorted by bin)
+- Test generate_pick_list optimization (bin location order)
+- Test get_operation (found / not found)
+- Test list_operations with filters
+- Test get_productivity (returns metrics dict)
+
+### test_router.py
+- Test POST /warehouse-operations (201)
+- Test GET /warehouse-operations (200)
+- Test GET /warehouse-operations/{id} (200)
+- Test PUT /warehouse-operations/{id} (200)
+- Test POST /warehouse-operations/{id}/start (200)
+- Test POST /warehouse-operations/{id}/tasks/{task_id}/complete (200)
+- Test POST /warehouse-operations/{id}/complete (200)
+- Test POST /warehouse-operations/{id}/cancel (200)
+- Test POST /warehouse-operations/pick-list (200)
+- Test GET /warehouse-operations/productivity (200)
+
+### test_validators.py
+- Test valid operation_type validation
+- Test from_bin != to_bin for move operations
+- Test quantity > 0 validation
+- Test operation_number uniqueness
+- Test status transition validation
+- Test all tasks completed before operation complete
+- Test cannot update non-pending operations
+- Test cannot cancel non-pending operations
+
+## Dependencies
+
+- `shared.types`: Base, BaseModel, BaseSchema, PaginatedResponse, AuditableMixin, Quantity, Priority
+- `shared.errors`: NotFoundError, ValidationError, DuplicateError, BusinessRuleError
+- `shared.schema`: ColLen, Precision
+- `src.foundation._001_database.engine`: get_db
+
+## Quality Checklist
+
+- [ ] All public functions have type hints and docstrings
+- [ ] All router endpoints use `/api/v1/warehouse-operations` prefix
+- [ ] Tests use pytest-asyncio
+- [ ] Only import from `shared/` and `_001_database`
+- [ ] Pick list optimization: tasks sorted by from_bin in ascending alphanumeric order
+- [ ] Auto-complete: when last task is completed, operation status auto-transitions to completed
+- [ ] Productivity metrics: operations_per_hour = completed_ops / hours_in_range
+- [ ] Productivity metrics: completion_rate = completed_ops / total_ops * 100
+- [ ] Productivity metrics: avg_completion_time = avg(completed_at - started_at) in minutes
+- [ ] Cancel only allowed in pending status
