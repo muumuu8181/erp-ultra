@@ -32,10 +32,11 @@ class BaseModel(Base):
 T = TypeVar('T')
 
 
+from pydantic import ConfigDict
+
 class BaseSchema(PydanticBase):
     """Base for all Pydantic schemas in the system."""
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True, arbitrary_types_allowed=True)
 
 
 class AuditableMixin(BaseSchema):
